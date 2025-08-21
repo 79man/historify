@@ -15,6 +15,7 @@ from app.utils.rate_limiter import broker_rate_limiter
 
 api_bp = Blueprint('api', __name__)
 
+
 @api_bp.route('/symbols', methods=['GET'])
 def get_symbols():
     """Get all available symbols"""
@@ -23,6 +24,7 @@ def get_symbols():
     watchlist_items = WatchlistItem.query.all()
     symbols_data = [item.to_dict() for item in watchlist_items]
     return jsonify(symbols_data)
+
 
 @api_bp.route('/download', methods=['POST'])
 def download_data():
@@ -337,6 +339,99 @@ def import_symbols():
     except Exception as e:
         db.session.rollback()
         return jsonify({'error': str(e)}), 500
+
+
+@api_bp.route('/import-ohlc-data', methods=['POST'])
+def import_ohlc_data():
+    """Import OHLC data directly from CSV for a symbol"""
+    try:
+        data = request.json
+        symbol = data.get('symbol')
+        exchange = data.get('exchange', 'NSE')
+        interval = data.get('interval', 'D')
+        csv_data = data.get('csv_data', [])
+
+        if not symbol:
+            return jsonify({'error': 'Symbol is required'}), 400
+
+        if not csv_data:
+            return jsonify({'error': 'No OHLC data provided'}), 400
+
+        # Get the dynamic table model for this symbol-exchange-interval combination
+        table_model = ensure_table_exists(symbol, exchange, interval)
+
+        success_count = 0
+        failed_count = 0
+        errors = []
+
+        for row in csv_data:
+            try:
+                # Parse the ISO timestamp with timezone
+                date_str = row.get('date')
+                # Parse ISO format: 2020-08-19T00:00:00+05:30
+                datetime_obj = datetime.fromisoformat(
+                    date_str.replace('+05:30', '+0530'))
+                date_obj = datetime_obj.date()
+                time_obj = datetime_obj.time()  # Extract time instead of setting to None
+
+                # Your format has close before open, so adjust accordingly
+                close_price = float(row.get('close', 0))
+                open_price = float(row.get('open', 0))
+                high_price = float(row.get('high', 0))
+                low_price = float(row.get('low', 0))
+                volume = int(row.get('volume', 0))
+
+                # Check if the data point exists in the dynamic table
+                existing = table_model.query.filter_by(
+                    date=date_obj,
+                    time=time_obj
+                ).first()
+
+                if existing:
+                    # Update existing data
+                    existing.open = open_price
+                    existing.high = high_price
+                    existing.low = low_price
+                    existing.close = close_price
+                    existing.volume = volume
+                else:
+                    # Create new data point in the dynamic table
+                    new_data = table_model(
+                        date=date_obj,
+                        time=time_obj,
+                        open=open_price,
+                        high=high_price,
+                        low=low_price,
+                        close=close_price,
+                        volume=volume
+                    )
+                    db.session.add(new_data)
+
+                success_count += 1
+
+            except Exception as e:
+                failed_count += 1
+                errors.append({
+                    'row': row,
+                    'error': str(e)
+                })
+                continue
+
+        # Commit all changes
+        db.session.commit()
+
+        return jsonify({
+            'success': True,
+            'message': f'Successfully imported {success_count} OHLC data points for {symbol}',
+            'imported': success_count,
+            'failed': failed_count,
+            'errors': errors
+        })
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 500
+
 
 @api_bp.route('/export', methods=['POST'])
 def export_data():
